@@ -8,6 +8,11 @@ import { dirname } from 'node:path';
  * 数据模型：
  *  - samples(stream_id, sample_id, ts, value, seq)
  *      seq 为全局单调递增的接收序号（写入即分配），(stream_id, sample_id) 唯一。
+ *      该行即观测的“第 1 版”（原始观测），seq 同时是第 1 版的生效序号。
+ *  - sample_revisions(stream_id, sample_id, revision, ts, value, effective_seq)
+ *      质控勘误产生的第 2..N 版；revision 从 2 起单调递增，effective_seq 为该版
+ *      生效时分配的接收序号。快照上界 Q 只可见 effective_seq <= Q 的最新版本，
+ *      故勘误前取得的分页游标始终看到旧版、勘误后开启的会话才看到新版。
  *  - seq_meta：单行，保存已分配的最后一个接收序号（= 快照上界来源）。
  */
 export class Store {
@@ -40,11 +45,62 @@ export class Store {
     this.db.exec(`
       INSERT OR IGNORE INTO seq_meta (id, last_seq) VALUES (1, 0)
     `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sample_revisions (
+        stream_id     TEXT    NOT NULL,
+        sample_id     TEXT    NOT NULL,
+        revision      INTEGER NOT NULL,   -- 原始观测为第 1 版，勘误从 2 起
+        ts            TEXT    NOT NULL,   -- 该版时刻（RFC3339 UTC 规范串）
+        value         INTEGER NOT NULL,
+        effective_seq INTEGER NOT NULL,   -- 该版生效时的接收序号
+        PRIMARY KEY (stream_id, sample_id, revision)
+      ) WITHOUT ROWID
+    `);
     this.#prepareStatements();
   }
 
   #prepareStatements() {
     const db = this.db;
+    // 快照可见版本：第 1 版（samples 行，生效序号 = seq）与各勘误版中，
+    // effective_seq <= 快照上界的最高 revision。勘误版不改变第 1 版的行，
+    // 因此旧快照（游标）永远看到旧版，新快照才看到新版。
+    // 流过滤下推到 UNION ALL 两支，窗口函数只在单流内分区取最高修订版。
+    const visibleCte = `
+      WITH visible AS (
+        SELECT
+          s.stream_id,
+          s.sample_id,
+          s.ts,
+          s.value,
+          s.seq,
+          1 AS revision,
+          s.seq AS effective_seq,
+          s.seq AS visible_seq
+        FROM samples s
+        WHERE s.stream_id = ?
+        UNION ALL
+        SELECT
+          r.stream_id,
+          r.sample_id,
+          r.ts,
+          r.value,
+          s.seq,
+          r.revision,
+          r.effective_seq,
+          r.effective_seq AS visible_seq
+        FROM sample_revisions r
+        JOIN samples s
+          ON s.stream_id = r.stream_id AND s.sample_id = r.sample_id
+        WHERE r.stream_id = ?
+          AND r.effective_seq <= ?
+      ),
+      chosen AS (
+        SELECT *,
+          ROW_NUMBER() OVER (
+            PARTITION BY stream_id, sample_id ORDER BY revision DESC
+          ) AS rn
+        FROM visible
+      )`;
     this.stmts = {
       getLastSeq: db.prepare('SELECT last_seq FROM seq_meta WHERE id = 1'),
       bumpSeq: db.prepare('UPDATE seq_meta SET last_seq = ? WHERE id = 1'),
@@ -55,29 +111,49 @@ export class Store {
         'INSERT INTO samples (stream_id, sample_id, ts, value, seq) VALUES (?, ?, ?, ?, ?)'
       ),
       pageStart: db.prepare(
-        `SELECT ts, sample_id AS sampleId, value, seq
-           FROM samples
-          WHERE stream_id = ?
-            AND seq <= ?
+        `${visibleCte}
+         SELECT sample_id AS sampleId, ts, value, seq, revision, effective_seq AS effectiveSeq
+           FROM chosen
+          WHERE rn = 1
+            AND visible_seq <= ?
             AND ts >= ? AND ts <= ?
           ORDER BY ts ASC, sample_id ASC
           LIMIT ?`
       ),
       pageAfter: db.prepare(
-        `SELECT ts, sample_id AS sampleId, value, seq
-           FROM samples
-          WHERE stream_id = ?
-            AND seq <= ?
+        `${visibleCte}
+         SELECT sample_id AS sampleId, ts, value, seq, revision, effective_seq AS effectiveSeq
+           FROM chosen
+          WHERE rn = 1
+            AND visible_seq <= ?
             AND ts >= ? AND ts <= ?
             AND (ts > ? OR (ts = ? AND sample_id > ?))
           ORDER BY ts ASC, sample_id ASC
           LIMIT ?`
       ),
       countSnapshot: db.prepare(
-        `SELECT COUNT(*) AS n FROM samples
-          WHERE stream_id = ? AND seq <= ? AND ts >= ? AND ts <= ?`
+        `${visibleCte}
+         SELECT COUNT(*) AS n FROM chosen
+          WHERE rn = 1
+            AND visible_seq <= ?
+            AND ts >= ? AND ts <= ?`
       ),
       totalSamples: db.prepare('SELECT COUNT(*) AS n FROM samples'),
+      // ---- 勘误（乐观并发）----
+      getSampleForRevision: db.prepare(
+        `SELECT s.seq,
+                COALESCE(MAX(r.revision), 1) AS currentRevision
+           FROM samples s
+           LEFT JOIN sample_revisions r
+             ON r.stream_id = s.stream_id AND r.sample_id = s.sample_id
+          WHERE s.stream_id = ? AND s.sample_id = ?
+          GROUP BY s.stream_id, s.sample_id`
+      ),
+      insertRevision: db.prepare(
+        `INSERT INTO sample_revisions
+           (stream_id, sample_id, revision, ts, value, effective_seq)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ),
     };
   }
 
@@ -136,22 +212,25 @@ export class Store {
   /**
    * 读取快照页（稳定排序：ts ASC, sampleId ASC）。
    * @param {string} streamId
-   * @param {number} snapshotSeq 快照上界（只含 seq <= snapshotSeq）
+   * @param {number} snapshotSeq 快照上界（只含 effective_seq <= snapshotSeq 的版本）
    * @param {{fromTs:string,toTs:string}} range 闭区间，按 ts 字符串比较
    * @param {{ts:string,sampleId:string}|null} after 严格大于该位置之后开始
    * @param {number} pageSize
    */
   readPage(streamId, snapshotSeq, range, after, pageSize) {
-    // keyset 分页：比较 (ts, sample_id) 元组，稳定且不依赖 OFFSET
+    // keyset 分页：比较 (ts, sample_id) 元组，稳定且不依赖 OFFSET。
+    // 绑定顺序：CTE 两支各绑定流（勘误支再绑快照上界），外层绑定可见性/范围/页大小。
     let rows;
     if (after) {
       rows = this.stmts.pageAfter.all(
-        streamId, snapshotSeq, range.fromTs, range.toTs,
+        streamId, streamId, snapshotSeq,
+        snapshotSeq, range.fromTs, range.toTs,
         after.ts, after.ts, after.sampleId, pageSize
       );
     } else {
       rows = this.stmts.pageStart.all(
-        streamId, snapshotSeq, range.fromTs, range.toTs, pageSize
+        streamId, streamId, snapshotSeq,
+        snapshotSeq, range.fromTs, range.toTs, pageSize
       );
     }
     return rows.map((r) => ({
@@ -159,13 +238,71 @@ export class Store {
       sampleId: r.sampleId,
       value: Number(r.value),
       seq: Number(r.seq),
+      revision: Number(r.revision),
+      effectiveSeq: Number(r.effectiveSeq),
     }));
   }
 
   countSnapshot(streamId, snapshotSeq, range) {
     return Number(
-      this.stmts.countSnapshot.get(streamId, snapshotSeq, range.fromTs, range.toTs).n
+      this.stmts.countSnapshot.get(
+        streamId, streamId, snapshotSeq,
+        snapshotSeq, range.fromTs, range.toTs
+      ).n
     );
+  }
+
+  /**
+   * 质控勘误：为已存在的观测创建下一版本。
+   * 原始观测视为第 1 版；仅当 expectedRevision 等于当前修订号时才创建下一版。
+   * 勘误与批次写入共用同一接收序号：新版本分配下一个 seq 作为 effective_seq，
+   * 因此它与新接收数据一样，只会进入此后开启的新快照。
+   *
+   * @returns {{revision:number, effectiveSeq:number}}
+   * @throws {SampleNotFoundError} 观测不存在（未知流 / 未知编号）
+   * @throws {RevisionConflictError} expectedRevision 过期；携带 currentRevision，且不改写数据
+   */
+  reviseSample(streamId, sampleId, { ts, value, expectedRevision }) {
+    const db = this.db;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const cur = this.stmts.getSampleForRevision.get(streamId, sampleId);
+      if (!cur) {
+        throw new SampleNotFoundError(
+          `观测不存在: stream=${streamId} sample=${sampleId}`,
+          { reason: 'sample_not_found', streamId, sampleId }
+        );
+      }
+      const currentRevision = Number(cur.currentRevision);
+      if (expectedRevision !== currentRevision) {
+        throw new RevisionConflictError(
+          `修订号过期：期望 ${expectedRevision}，当前为 ${currentRevision}`,
+          {
+            reason: 'revision_conflict',
+            sampleId,
+            expectedRevision,
+            currentRevision,
+          }
+        );
+      }
+      const effectiveSeq = Number(this.stmts.getLastSeq.get().last_seq) + 1;
+      const revision = currentRevision + 1;
+      this.stmts.insertRevision.run(
+        streamId, sampleId, revision, ts, value, effectiveSeq
+      );
+      this.stmts.bumpSeq.run(effectiveSeq);
+      db.exec('COMMIT');
+      return { revision, effectiveSeq };
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /** 观测当前（最新）修订号；不存在返回 null。 */
+  currentRevision(streamId, sampleId) {
+    const row = this.stmts.getSampleForRevision.get(streamId, sampleId);
+    return row ? Number(row.currentRevision) : null;
   }
 
   totalSamples() {
@@ -181,6 +318,24 @@ export class BatchConflictError extends Error {
   constructor(message, details) {
     super(message);
     this.name = 'BatchConflictError';
+    this.statusCode = 409;
+    this.details = details;
+  }
+}
+
+export class SampleNotFoundError extends Error {
+  constructor(message, details) {
+    super(message);
+    this.name = 'SampleNotFoundError';
+    this.statusCode = 404;
+    this.details = details;
+  }
+}
+
+export class RevisionConflictError extends Error {
+  constructor(message, details) {
+    super(message);
+    this.name = 'RevisionConflictError';
     this.statusCode = 409;
     this.details = details;
   }

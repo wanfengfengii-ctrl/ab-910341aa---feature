@@ -124,4 +124,28 @@ export function validateQuery(searchParams) {
   return out;
 }
 
+/**
+ * 校验勘误请求体：{ expectedRevision, ts, value }。
+ * 原始观测视为第 1 版，故首次勘误应携带 expectedRevision: 1。
+ * @returns {{expectedRevision:number, ts:string, value:number}}
+ */
+export function validateRevision(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ValidationError('请求体必须为对象，含 expectedRevision、ts、value');
+  }
+  const { expectedRevision, ts, value } = body;
+
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 1) {
+    throw new ValidationError('expectedRevision 必须为 >= 1 的整数', {
+      received: expectedRevision,
+    });
+  }
+  const { canonical } = parseRfc3339(ts);
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    throw new ValidationError('value 必须为整数（安全整数范围内）');
+  }
+
+  return { expectedRevision, ts: canonical, value };
+}
+
 export const TIME_BOUNDS = { MIN_TS, MAX_TS };

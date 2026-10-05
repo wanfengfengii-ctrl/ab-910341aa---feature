@@ -35,6 +35,12 @@ const postSamples = (stream, samples) =>
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ samples }),
   });
+const revise = (stream, sampleId, body) =>
+  api(`/api/streams/${stream}/samples/${encodeURIComponent(sampleId)}/revisions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 
 test('健康检查可用', async () => {
   const r = await api('/health');
@@ -247,4 +253,136 @@ test('游标在服务重启后仍可继续（同密钥 + 持久化 DB）', async
   assert.deepEqual(page.items.map((i) => i.sampleId), ['r4']);
   assert.equal(page.nextCursor, null);
   assert.equal(page.done, true);
+});
+
+test('POST 勘误：成功返回 revision/effectiveSeq，旧游标见旧版、新会话见新版', async () => {
+  const stream = 'rev';
+  const pr = await postSamples(stream, [
+    { sampleId: 's1', ts: '2026-02-01T00:00:01Z', value: 1 },
+    { sampleId: 's2', ts: '2026-02-01T00:00:02Z', value: 2 },
+    { sampleId: 's3', ts: '2026-02-01T00:00:03Z', value: 3 },
+  ]);
+  const posted = await pr.json();
+
+  // 首页固定旧快照（pageSize=2），持有游标
+  let r = await api(`/api/streams/${stream}/samples?pageSize=2`);
+  let page = await r.json();
+  const oldSnap = page.snapshotSeq;
+  assert.deepEqual(page.items.map((i) => i.sampleId), ['s1', 's2']);
+  const cursor = page.nextCursor;
+
+  // 勘误 s1：读数修正且时刻前移
+  r = await revise(stream, 's1', {
+    expectedRevision: 1, ts: '2026-02-01T00:00:00Z', value: 100,
+  });
+  assert.equal(r.status, 200);
+  let j = await r.json();
+  assert.equal(j.revision, 2);
+  assert.equal(j.effectiveSeq, posted.lastSeq + 1);
+
+  // 旧游标继续：仍见旧版 s1 值 1、旧时刻；s3 恰好一次
+  r = await api(`/api/streams/${stream}/samples?pageSize=2&cursor=${encodeURIComponent(cursor)}`);
+  assert.equal(r.status, 200);
+  page = await r.json();
+  assert.equal(page.snapshotSeq, oldSnap, '旧会话快照序号不变');
+  assert.deepEqual(page.items.map((i) => [i.sampleId, i.ts, i.value]), [
+    ['s3', '2026-02-01T00:00:03.000000000Z', 3],
+  ]);
+  assert.equal(page.done, true);
+
+  // 新会话：只见新版，s1 排到最前
+  r = await api(`/api/streams/${stream}/samples?pageSize=100`);
+  page = await r.json();
+  assert.ok(page.snapshotSeq >= posted.lastSeq + 1);
+  assert.deepEqual(page.items.map((i) => i.sampleId), ['s1', 's2', 's3']);
+  assert.equal(page.items[0].value, 100);
+  assert.equal(page.items[0].ts, '2026-02-01T00:00:00.000000000Z');
+});
+
+test('POST 勘误：未知观测 404、未知流 404', async () => {
+  await postSamples('rv-exists', [{ sampleId: 'a', ts: '2026-01-01T00:00:00Z', value: 1 }]);
+  let r = await revise('rv-exists', 'ghost', {
+    expectedRevision: 1, ts: '2026-01-01T00:00:00Z', value: 1,
+  });
+  assert.equal(r.status, 404);
+  let j = await r.json();
+  assert.equal(j.error.code, 'sample_not_found');
+  assert.equal(j.error.details.sampleId, 'ghost');
+
+  r = await revise('rv-no-such-stream', 'a', {
+    expectedRevision: 1, ts: '2026-01-01T00:00:00Z', value: 1,
+  });
+  assert.equal(r.status, 404);
+  j = await r.json();
+  assert.equal(j.error.code, 'sample_not_found');
+});
+
+test('POST 勘误：过期修订号 409 回送当前修订号且不改写', async () => {
+  const stream = 'rv-conflict';
+  await postSamples(stream, [{ sampleId: 'a', ts: '2026-01-01T00:00:00Z', value: 1 }]);
+  let r = await revise(stream, 'a', {
+    expectedRevision: 1, ts: '2026-01-01T00:00:02Z', value: 2,
+  });
+  assert.equal(r.status, 200);
+
+  // 用过期的 expectedRevision=1 再勘误
+  r = await revise(stream, 'a', {
+    expectedRevision: 1, ts: '2026-01-01T00:00:09Z', value: 99,
+  });
+  assert.equal(r.status, 409);
+  const j = await r.json();
+  assert.equal(j.error.code, 'revision_conflict');
+  assert.equal(j.error.details.currentRevision, 2);
+  assert.equal(j.error.details.expectedRevision, 1);
+
+  // 数据未被改写：新会话仍看到第 2 版（值 2）
+  r = await api(`/api/streams/${stream}/samples?pageSize=10`);
+  const page = await r.json();
+  assert.equal(page.items[0].value, 2);
+
+  // 用正确的当前修订号可以继续
+  r = await revise(stream, 'a', {
+    expectedRevision: 2, ts: '2026-01-01T00:00:03Z', value: 3,
+  });
+  assert.equal(r.status, 200);
+  const ok = await r.json();
+  assert.equal(ok.revision, 3);
+});
+
+test('POST 勘误：请求体非法 -> 400 invalid_request', async () => {
+  await postSamples('rv-bad', [{ sampleId: 'a', ts: '2026-01-01T00:00:00Z', value: 1 }]);
+  let r = await revise('rv-bad', 'a', { ts: '2026-01-01T00:00:00Z', value: 1 });
+  assert.equal(r.status, 400);
+  r = await revise('rv-bad', 'a', { expectedRevision: 1, ts: 'nope', value: 1 });
+  assert.equal(r.status, 400);
+  r = await revise('rv-bad', 'a', { expectedRevision: 1, ts: '2026-01-01T00:00:00Z', value: 1.5 });
+  assert.equal(r.status, 400);
+  r = await api('/api/streams/rv-bad/samples/a/revisions', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{oops',
+  });
+  assert.equal(r.status, 400);
+});
+
+test('POST 勘误不改变既有批量/分页错误语义，且不影响无勘误观测', async () => {
+  const stream = 'rv-compat';
+  // 既有批次冲突语义保持
+  let r = await postSamples(stream, [
+    { sampleId: 'x', ts: '2026-01-01T00:00:00Z', value: 1 },
+    { sampleId: 'x', ts: '2026-01-01T00:00:01Z', value: 2 },
+  ]);
+  assert.equal(r.status, 409);
+  // 勘误一条观测，另一条保持第 1 版
+  await postSamples(stream, [
+    { sampleId: 'a', ts: '2026-01-01T00:00:01Z', value: 1 },
+    { sampleId: 'b', ts: '2026-01-01T00:00:02Z', value: 2 },
+  ]);
+  r = await revise(stream, 'b', {
+    expectedRevision: 1, ts: '2026-01-01T00:00:00Z', value: 20,
+  });
+  assert.equal(r.status, 200);
+  r = await api(`/api/streams/${stream}/samples?pageSize=100`);
+  const page = await r.json();
+  assert.deepEqual(page.items.map((i) => [i.sampleId, i.value]), [
+    ['b', 20], ['a', 1],
+  ]);
 });

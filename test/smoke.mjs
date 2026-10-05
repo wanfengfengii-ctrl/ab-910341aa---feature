@@ -48,6 +48,12 @@ async function runSmoke(baseUrl, { restartFlow = null } = {}) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ samples }),
     });
+  const revise = (stream, sampleId, body) =>
+    fetch(`${baseUrl}/api/streams/${stream}/samples/${encodeURIComponent(sampleId)}/revisions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
 
   // 1) 健康检查
   check('GET /health 200', await waitForHealth(baseUrl));
@@ -173,6 +179,138 @@ async function runSmoke(baseUrl, { restartFlow = null } = {}) {
   check('新快照包含中途插入的早时刻数据',
     page.items.slice(0, 2).map((i) => i.sampleId).join(',') === 'old1,old2',
     JSON.stringify(page.items.map((i) => i.sampleId)));
+
+  // 14) 勘误：分页中途修正时刻/读数 —— 旧游标见旧版且恰好一次，新会话按新版时刻排序
+  // 14a) 勘误把“已翻页过”的观测时刻后移：旧会话不得在新位置再次看到它
+  const revStream = S('revise-later');
+  r = await post(revStream, [1, 2, 3, 4, 5].map((n) => ({
+    sampleId: `m${n}`, ts: `2026-10-01T00:00:0${n}Z`, value: n * 10,
+  })));
+  const revPosted = await r.json();
+  r = await get(`/api/streams/${revStream}/samples?pageSize=2`);
+  page = await r.json();
+  const revSnap = page.snapshotSeq;
+  check('勘误流首页取到 m1,m2 旧版',
+    JSON.stringify(page.items.map((i) => [i.sampleId, i.value])) ===
+    JSON.stringify([['m1', 10], ['m2', 20]]), JSON.stringify(page.items));
+  let revCursor = page.nextCursor;
+
+  r = await revise(revStream, 'm1', {
+    expectedRevision: 1, ts: '2026-10-01T00:00:10Z', value: 11,
+  });
+  let revBody = await r.json();
+  check('勘误 m1 -> 200 revision=2 且分配下一个接收序号',
+    r.status === 200 && revBody.revision === 2 &&
+    revBody.effectiveSeq === revPosted.lastSeq + 1,
+    `status=${r.status} body=${JSON.stringify(revBody)}`);
+
+  const oldSeen = [...page.items.map((i) => i.sampleId)];
+  while (revCursor) {
+    r = await get(`/api/streams/${revStream}/samples?pageSize=2&cursor=${encodeURIComponent(revCursor)}`);
+    check('勘误后旧游标翻页 200', r.status === 200, `status=${r.status}`);
+    page = await r.json();
+    check('勘误后旧会话 snapshotSeq 不变', page.snapshotSeq === revSnap,
+      `${page.snapshotSeq} != ${revSnap}`);
+    oldSeen.push(...page.items.map((i) => i.sampleId));
+    revCursor = page.nextCursor;
+  }
+  check('旧快照恰好 m1..m5 各一次（后移的新版不在尾部重复）',
+    JSON.stringify(oldSeen) === JSON.stringify(['m1', 'm2', 'm3', 'm4', 'm5']),
+    JSON.stringify(oldSeen));
+
+  // 新无游标会话：只见新版，m1 按新时刻排到最后，值为 11
+  r = await get(`/api/streams/${revStream}/samples?pageSize=100`);
+  page = await r.json();
+  check('勘误后新会话 snapshotSeq 推进', page.snapshotSeq >= revBody.effectiveSeq,
+    `${page.snapshotSeq} < ${revBody.effectiveSeq}`);
+  check('新会话按新版时刻重排：m2..m5,m1，且 m1 为新读数',
+    JSON.stringify(page.items.map((i) => i.sampleId)) ===
+    JSON.stringify(['m2', 'm3', 'm4', 'm5', 'm1']) &&
+    page.items[4].value === 11 &&
+    new Set(page.items.map((i) => i.sampleId)).size === 5,
+    JSON.stringify(page.items));
+
+  // 14b) 勘误把“尚未翻到”的观测时刻前移：旧会话不得跳过它，仍按旧位置旧值出现
+  const earlyStream = S('revise-earlier');
+  await post(earlyStream, [1, 2, 3, 4, 5].map((n) => ({
+    sampleId: `e${n}`, ts: `2026-10-02T00:00:0${n}Z`, value: n,
+  })));
+  r = await get(`/api/streams/${earlyStream}/samples?pageSize=2`);
+  page = await r.json();
+  const earlySnap = page.snapshotSeq;
+  let earlyCursor = page.nextCursor;
+  r = await revise(earlyStream, 'e4', {
+    expectedRevision: 1, ts: '2026-10-02T00:00:00Z', value: 404,
+  });
+  check('勘误 e4（前移）-> 200 revision=2',
+    r.status === 200 && (await r.json()).revision === 2, `status=${r.status}`);
+  const earlySeen = ['e1', 'e2'];
+  const earlyValues = new Map(page.items.map((i) => [i.sampleId, i.value]));
+  while (earlyCursor) {
+    r = await get(`/api/streams/${earlyStream}/samples?pageSize=2&cursor=${encodeURIComponent(earlyCursor)}`);
+    page = await r.json();
+    check('前移勘误后旧会话 snapshotSeq 不变', page.snapshotSeq === earlySnap);
+    for (const it of page.items) {
+      earlySeen.push(it.sampleId);
+      earlyValues.set(it.sampleId, it.value);
+    }
+    earlyCursor = page.nextCursor;
+  }
+  check('旧快照仍按旧位置看到 e4 旧值，且无漏项/重复',
+    JSON.stringify(earlySeen) === JSON.stringify(['e1', 'e2', 'e3', 'e4', 'e5']) &&
+    earlyValues.get('e4') === 4,
+    JSON.stringify(earlySeen));
+  r = await get(`/api/streams/${earlyStream}/samples?pageSize=100`);
+  page = await r.json();
+  check('新会话中 e4 按新时刻排到首位且为新值，其余各一次',
+    JSON.stringify(page.items.map((i) => i.sampleId)) ===
+    JSON.stringify(['e4', 'e1', 'e2', 'e3', 'e5']) &&
+    page.items[0].value === 404,
+    JSON.stringify(page.items));
+
+  // 14c) 并发冲突：过期修订号 -> 409 回送当前修订号，且不改写数据
+  r = await revise(revStream, 'm1', {
+    expectedRevision: 1, ts: '2026-10-01T00:00:11Z', value: 999,
+  });
+  revBody = await r.json();
+  check('过期 expectedRevision -> 409 revision_conflict 且回送 currentRevision=2',
+    r.status === 409 && revBody.error.code === 'revision_conflict' &&
+    revBody.error.details.currentRevision === 2 &&
+    revBody.error.details.expectedRevision === 1,
+    `status=${r.status} body=${JSON.stringify(revBody)}`);
+  r = await get(`/api/streams/${revStream}/samples?pageSize=100`);
+  page = await r.json();
+  check('409 不改写数据：m1 仍是第 2 版（值 11，时刻 10）',
+    page.items.find((i) => i.sampleId === 'm1').value === 11,
+    JSON.stringify(page.items.find((i) => i.sampleId === 'm1')));
+  r = await revise(revStream, 'm1', {
+    expectedRevision: 2, ts: '2026-10-01T00:00:09Z', value: 12,
+  });
+  revBody = await r.json();
+  check('用当前修订号再次勘误 -> 200 revision=3',
+    r.status === 200 && revBody.revision === 3, `status=${r.status} body=${JSON.stringify(revBody)}`);
+
+  // 14d) 未知观测 / 未知流 -> 404；非法请求体 -> 400
+  r = await revise(revStream, 'ghost', {
+    expectedRevision: 1, ts: '2026-10-01T00:00:00Z', value: 1,
+  });
+  body = await r.json();
+  check('未知观测勘误 -> 404 sample_not_found',
+    r.status === 404 && body.error.code === 'sample_not_found', `status=${r.status}`);
+  r = await revise(S('no-such-stream'), 'm1', {
+    expectedRevision: 1, ts: '2026-10-01T00:00:00Z', value: 1,
+  });
+  check('未知流勘误 -> 404', r.status === 404, `status=${r.status}`);
+  r = await revise(revStream, 'm1', { ts: '2026-10-01T00:00:00Z', value: 1 });
+  check('缺 expectedRevision -> 400', r.status === 400, `status=${r.status}`);
+  r = await revise(revStream, 'm1', {
+    expectedRevision: 3, ts: 'not-a-time', value: 1,
+  });
+  check('非法时刻 -> 400', r.status === 400, `status=${r.status}`);
+  r = await fetch(`${baseUrl}/api/streams/${revStream}/samples/m1/revisions`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{oops',
+  });
+  check('勘误坏 JSON -> 400', r.status === 400, `status=${r.status}`);
 
   // 13) 重启后游标继续（仅本地模式可以真的重启进程）
   if (restartFlow) {
