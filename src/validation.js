@@ -89,6 +89,36 @@ export function validateBatch(body) {
 }
 
 /**
+ * 校验勘误请求体：{ expectedRevision, ts, value }。
+ *  - expectedRevision：客户端所依据的当前修订号（正整数）
+ *  - ts：新的观测时刻（严格 RFC3339，归一化为 UTC）
+ *  - value：新的整数读数
+ * @returns {{expectedRevision:number, ts:string, value:number}}
+ */
+export function validateRevision(body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ValidationError('请求体必须为对象，且含 expectedRevision / ts / value');
+  }
+  const { expectedRevision, ts, value } = body;
+
+  if (typeof expectedRevision !== 'number' ||
+      !Number.isInteger(expectedRevision) || expectedRevision < 1) {
+    throw new ValidationError('expectedRevision 必须为正整数', {
+      received: expectedRevision,
+    });
+  }
+
+  const { canonical } = parseRfc3339(ts);
+
+  // 与批量接收同一套整数读数规则
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    throw new ValidationError('value 必须为整数（安全整数范围内）');
+  }
+
+  return { expectedRevision, ts: canonical, value };
+}
+
+/**
  * 校验查询参数。from/to 可缺省（缺省用 MIN/MAX）；cursor 存在时时间范围由游标会话决定。
  */
 export function validateQuery(searchParams) {

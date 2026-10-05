@@ -48,6 +48,12 @@ async function runSmoke(baseUrl, { restartFlow = null } = {}) {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ samples }),
     });
+  const revise = (stream, sampleId, payload) =>
+    fetch(`${baseUrl}/api/streams/${stream}/samples/${sampleId}/revisions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
 
   // 1) 健康检查
   check('GET /health 200', await waitForHealth(baseUrl));
@@ -173,6 +179,116 @@ async function runSmoke(baseUrl, { restartFlow = null } = {}) {
   check('新快照包含中途插入的早时刻数据',
     page.items.slice(0, 2).map((i) => i.sampleId).join(',') === 'old1,old2',
     JSON.stringify(page.items.map((i) => i.sampleId)));
+
+  // 12b) 质控勘误：分页中途执行，旧游标见旧版、新会话见新版并按新时刻排序
+  const revStream = S('revise');
+  r = await post(revStream, [
+    { sampleId: 'k1', ts: '2026-09-10T00:00:01Z', value: 10 },
+    { sampleId: 'k2', ts: '2026-09-10T00:00:02Z', value: 20 },
+    { sampleId: 'k3', ts: '2026-09-10T00:00:03Z', value: 30 },
+    { sampleId: 'k4', ts: '2026-09-10T00:00:04Z', value: 40 },
+    { sampleId: 'k5', ts: '2026-09-10T00:00:05Z', value: 50 },
+  ]);
+  check('勘误流初始批次 200', r.status === 200, `status=${r.status}`);
+
+  // 未知观测 -> 404
+  r = await revise(revStream, 'ghost', {
+    expectedRevision: 1, ts: '2026-09-10T00:00:00Z', value: 1,
+  });
+  body = await r.json();
+  check('勘误未知观测 -> 404 sample_not_found',
+    r.status === 404 && body.error.code === 'sample_not_found', `status=${r.status}`);
+
+  // 非法请求体 -> 400
+  r = await revise(revStream, 'k1', { expectedRevision: 1, ts: 'not-a-time', value: 1 });
+  check('勘误非法时刻 -> 400', r.status === 400, `status=${r.status}`);
+  r = await revise(revStream, 'k1', { expectedRevision: 0, ts: '2026-09-10T00:00:00Z', value: 1 });
+  check('勘误非法修订号 -> 400', r.status === 400, `status=${r.status}`);
+
+  // 开启快照会话取首页（k1,k2），保存旧游标
+  r = await get(`/api/streams/${revStream}/samples?pageSize=2`);
+  page = await r.json();
+  const revSnapSeq = page.snapshotSeq;
+  check('勘误流首页顺序 k1,k2',
+    JSON.stringify(page.items.map((i) => i.sampleId)) === JSON.stringify(['k1', 'k2']),
+    JSON.stringify(page.items));
+  let revCursor = page.nextCursor;
+  check('勘误流首页有游标', typeof revCursor === 'string');
+
+  // —— 分页中途执行勘误 ——
+  // k3 后移到 00:00:09 并改读数；k4 前移到 09-09 并改读数
+  r = await revise(revStream, 'k3', {
+    expectedRevision: 1, ts: '2026-09-10T00:00:09Z', value: 303,
+  });
+  let rb = await r.json().catch(() => null);
+  check('勘误 k3 基于第 1 版 -> 201 第 2 版',
+    r.status === 201 && rb && rb.revision === 2 &&
+    typeof rb.effectiveSeq === 'number',
+    `status=${r.status} body=${JSON.stringify(rb)}`);
+
+  // 并发/过期冲突：再次用 expectedRevision=1 -> 409 且回传当前修订号
+  r = await revise(revStream, 'k3', {
+    expectedRevision: 1, ts: '2026-09-10T00:00:08Z', value: 999,
+  });
+  body = await r.json();
+  check('过期修订号 -> 409 revision_conflict 且带当前修订号',
+    r.status === 409 && body.error.code === 'revision_conflict' &&
+    body.error.details.currentRevision === 2 &&
+    body.error.details.expectedRevision === 1,
+    `status=${r.status} ${JSON.stringify(body)}`);
+
+  r = await revise(revStream, 'k4', {
+    expectedRevision: 1, ts: '2026-09-09T00:00:00Z', value: 404,
+  });
+  check('勘误 k4 -> 201', r.status === 201, `status=${r.status}`);
+
+  // 用当前修订号 2 再勘误 k3 -> 第 3 版
+  r = await revise(revStream, 'k3', {
+    expectedRevision: 2, ts: '2026-09-10T00:00:09Z', value: 333,
+  });
+  rb = await r.json().catch(() => null);
+  check('携带当前修订号重试 -> 201 第 3 版',
+    r.status === 201 && rb && rb.revision === 3, `status=${r.status} ${JSON.stringify(rb)}`);
+
+  // 旧游标继续遍历：仍是旧版内容/页序，每观测恰好一次，快照序号不变
+  const revSeen = page.items.map((i) => ({ ...i }));
+  let revGuard = 0;
+  while (revCursor) {
+    r = await get(`/api/streams/${revStream}/samples?pageSize=2` +
+      `&cursor=${encodeURIComponent(revCursor)}`);
+    check('勘误期间翻页 200', r.status === 200, `status=${r.status}`);
+    page = await r.json();
+    check('勘误期间 snapshotSeq 不变', page.snapshotSeq === revSnapSeq,
+      `${page.snapshotSeq} != ${revSnapSeq}`);
+    for (const it of page.items) revSeen.push(it);
+    revCursor = page.nextCursor;
+    if (++revGuard > 20) { check('勘误分页守卫', false); break; }
+  }
+  check('旧快照恰好一次且顺序不变',
+    JSON.stringify(revSeen.map((i) => i.sampleId)) ===
+    JSON.stringify(['k1', 'k2', 'k3', 'k4', 'k5']),
+    JSON.stringify(revSeen.map((i) => i.sampleId)));
+  check('旧快照保留旧读数（冲突/勘误均不可见）',
+    JSON.stringify(revSeen.map((i) => i.value)) === JSON.stringify([10, 20, 30, 40, 50]),
+    JSON.stringify(revSeen.map((i) => i.value)));
+  const ids = revSeen.map((i) => i.sampleId);
+  check('旧快照中无观测消失或重复（每 ID 恰一次）',
+    new Set(ids).size === 5 && ids.length === 5);
+
+  // 修订后开启的无游标会话：只看新版，按新版时刻重新参与稳定排序
+  r = await get(`/api/streams/${revStream}/samples?pageSize=100`);
+  page = await r.json();
+  check('新快照上界推进', page.snapshotSeq > revSnapSeq,
+    `${page.snapshotSeq} <= ${revSnapSeq}`);
+  check('新会话只看新版并按新时刻排序（k4 前移、k3 后移，各一次）',
+    JSON.stringify(page.items.map((i) => [i.sampleId, i.value])) ===
+    JSON.stringify([
+      ['k4', 404], ['k1', 10], ['k2', 20], ['k5', 50], ['k3', 333],
+    ]),
+    JSON.stringify(page.items.map((i) => [i.sampleId, i.value])));
+  const newIds = page.items.map((i) => i.sampleId);
+  check('新快照中每观测也恰好一次',
+    newIds.length === 5 && new Set(newIds).size === 5);
 
   // 13) 重启后游标继续（仅本地模式可以真的重启进程）
   if (restartFlow) {

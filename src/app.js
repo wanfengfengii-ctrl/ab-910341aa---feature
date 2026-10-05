@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { Store, BatchConflictError } from './db.js';
+import { Store, BatchConflictError, RevisionConflictError } from './db.js';
 import {
   issueCursor,
   parseCursor,
@@ -10,6 +10,7 @@ import {
 import {
   validateBatch,
   validateQuery,
+  validateRevision,
   ValidationError,
   TIME_BOUNDS,
 } from './validation.js';
@@ -161,6 +162,42 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
     }
   }
 
+  /**
+   * POST /api/streams/:streamId/samples/:sampleId/revisions
+   * 质控勘误：{ expectedRevision, ts, value }。原始观测为第 1 版；
+   * 仅当 expectedRevision 为当前修订号时创建下一版。
+   *  - 未知观测 -> 404
+   *  - 修订号过期 -> 409 并回传当前修订号，数据不被改写
+   *  - 成功 -> 201 { sampleId, revision, effectiveSeq }
+   */
+  async function handleRevision(req, res, streamId, sampleId) {
+    if (typeof sampleId !== 'string' || sampleId.length === 0 ||
+        sampleId.length > 200) {
+      return sendError(res, 400, 'invalid_sample_id', 'sampleId 非法');
+    }
+    const body = await readJson(req);
+    const { expectedRevision, ts, value } = validateRevision(body);
+    try {
+      const result = store.reviseSample(
+        streamId, sampleId, expectedRevision, ts, value
+      );
+      if (result === null) {
+        return sendError(res, 404, 'sample_not_found',
+          `观测不存在: ${sampleId}`, { sampleId });
+      }
+      return send(res, 201, {
+        sampleId,
+        revision: result.revision,
+        effectiveSeq: result.effectiveSeq,
+      });
+    } catch (err) {
+      if (err instanceof RevisionConflictError) {
+        return sendError(res, 409, 'revision_conflict', err.message, err.details);
+      }
+      throw err;
+    }
+  }
+
   const handler = async (req, res) => {
     try {
       const url = new URL(req.url, 'http://localhost');
@@ -172,7 +209,11 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
         });
       }
 
-      const m = url.pathname.match(/^\/api\/streams\/([^/]+)\/samples\/?$/);
+      const mSamples = url.pathname.match(/^\/api\/streams\/([^/]+)\/samples\/?$/);
+      const mRevision = url.pathname.match(
+        /^\/api\/streams\/([^/]+)\/samples\/([^/]+)\/revisions\/?$/
+      );
+      const m = mSamples ?? mRevision;
       if (!m) {
         return sendError(res, 404, 'not_found', `路径不存在: ${url.pathname}`);
       }
@@ -184,6 +225,19 @@ export function createApp({ dbPath, cursorSecret = randomBytes(32).toString('hex
       }
       if (!STREAM_RE.test(streamId)) {
         return sendError(res, 400, 'invalid_stream_id', 'streamId 非法');
+      }
+
+      if (mRevision) {
+        if (req.method !== 'POST') {
+          return sendError(res, 405, 'method_not_allowed', '该路径仅支持 POST');
+        }
+        let sampleId;
+        try {
+          sampleId = decodeURIComponent(mRevision[2]);
+        } catch {
+          return sendError(res, 400, 'invalid_sample_id', 'sampleId 编码非法');
+        }
+        return await handleRevision(req, res, streamId, sampleId);
       }
 
       if (req.method === 'POST') return await handlePost(req, res, streamId);

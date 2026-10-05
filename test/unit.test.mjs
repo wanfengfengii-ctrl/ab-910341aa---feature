@@ -4,9 +4,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { Store, BatchConflictError } from '../src/db.js';
+import { Store, BatchConflictError, RevisionConflictError } from '../src/db.js';
 import { issueCursor, parseCursor, bindCursor, CursorError } from '../src/cursor.js';
-import { validateBatch, validateQuery, ValidationError } from '../src/validation.js';
+import { validateBatch, validateQuery, validateRevision, ValidationError } from '../src/validation.js';
 
 const R = (ts, sid, v = 1) => ({ sampleId: sid, ts, value: v });
 
@@ -115,6 +115,120 @@ test('Store: 时间范围过滤（闭区间）', () => {
   s.close();
 });
 
+test('Store: 勘误追加版本；旧快照看旧版、新快照看新版并按新时刻重排', () => {
+  const s = new Store(':memory:');
+  s.insertBatch('st', [
+    R('2026-01-01T00:00:01Z', 'a', 1),
+    R('2026-01-01T00:00:02Z', 'b', 2),
+    R('2026-01-01T00:00:03Z', 'c', 3),
+  ]);
+  const oldSnap = s.currentSeq(); // 3
+
+  // 把 b 从 00:00:02 勘误到 00:00:04，并改读数
+  const rv = s.reviseSample(
+    'st', 'b', 1, '2026-01-01T00:00:04.000000000Z', 22
+  );
+  assert.deepEqual(rv, { revision: 2, effectiveSeq: 4 });
+
+  // 旧快照：b 仍是旧版（旧时刻/旧读数），页序不变
+  const oldPage = s.readPage('st', oldSnap, { fromTs: '0', toTs: 'z' }, null, 100);
+  assert.deepEqual(oldPage.map((r) => [r.sampleId, r.ts, r.value]), [
+    ['a', '2026-01-01T00:00:01Z', 1],
+    ['b', '2026-01-01T00:00:02Z', 2],
+    ['c', '2026-01-01T00:00:03Z', 3],
+  ]);
+
+  // 新快照：b 显示新版，并移动到末尾（新时刻 00:00:04），仍只出现一次
+  const newPage = s.readPage('st', s.currentSeq(), { fromTs: '0', toTs: 'z' }, null, 100);
+  assert.deepEqual(newPage.map((r) => [r.sampleId, r.ts, r.value]), [
+    ['a', '2026-01-01T00:00:01Z', 1],
+    ['c', '2026-01-01T00:00:03Z', 3],
+    ['b', '2026-01-01T00:00:04.000000000Z', 22],
+  ]);
+  assert.equal(s.totalSamples(), 3, '逻辑观测数不随勘误增长');
+  s.close();
+});
+
+test('Store: 勘误把时刻前移也只影响新快照，且每个观测恰好一次', () => {
+  const s = new Store(':memory:');
+  s.insertBatch('st', [
+    R('2026-01-01T00:00:01Z', 'a'),
+    R('2026-01-01T00:00:02Z', 'b'),
+  ]);
+  const oldSnap = s.currentSeq();
+  s.reviseSample('st', 'a', 1, '2025-12-31T23:59:59.000000000Z', 99);
+
+  const oldPage = s.readPage('st', oldSnap, { fromTs: '0', toTs: 'z' }, null, 100);
+  assert.deepEqual(oldPage.map((r) => r.sampleId), ['a', 'b']);
+  assert.equal(oldPage[0].value, 1);
+
+  const newPage = s.readPage('st', s.currentSeq(), { fromTs: '0', toTs: 'z' }, null, 100);
+  assert.deepEqual(newPage.map((r) => r.sampleId), ['a', 'b']);
+  assert.equal(newPage[0].value, 99);
+  assert.equal(newPage.length, 2, '同一观测不得出现两次');
+  s.close();
+});
+
+test('Store: 勘误乐观锁——未知观测 null；过期修订号 409 且不改写', () => {
+  const s = new Store(':memory:');
+  s.insertBatch('st', [R('2026-01-01T00:00:00Z', 'a')]);
+
+  assert.equal(s.reviseSample('st', 'nope', 1, '2026-01-01T00:01:00Z', 1), null);
+  assert.equal(s.reviseSample('st2', 'a', 1, '2026-01-01T00:01:00Z', 1),
+    null, '其他流的同号观测不可见');
+
+  // 期望修订号 1 首次成功
+  const rv = s.reviseSample('st', 'a', 1, '2026-01-01T00:01:00.000000000Z', 11);
+  assert.equal(rv.revision, 2);
+
+  // 再次用过期的 1 -> 冲突并带当前修订号
+  assert.throws(
+    () => s.reviseSample('st', 'a', 1, '2026-01-01T00:02:00.000000000Z', 12),
+    (e) =>
+      e instanceof RevisionConflictError &&
+      e.details.currentRevision === 2 &&
+      e.details.expectedRevision === 1
+  );
+  // 用当前修订号 2 -> 第 3 版
+  const rv3 = s.reviseSample('st', 'a', 2, '2026-01-01T00:03:00.000000000Z', 13);
+  assert.equal(rv3.revision, 3);
+  assert.equal(rv3.effectiveSeq, 3);
+
+  // 最新快照只显示第 3 版，恰好一次
+  const page = s.readPage('st', s.currentSeq(), { fromTs: '0', toTs: 'z' }, null, 100);
+  assert.equal(page.length, 1);
+  assert.equal(page[0].value, 13);
+  assert.equal(s.currentSeq(), 3, '失败的勘误不占用序号');
+  s.close();
+});
+
+test('Store: 勘误中途修改旧快照 keyset 位置，旧游标仍恰好遍历一次', () => {
+  const s = new Store(':memory:');
+  s.insertBatch('st', [
+    R('2026-01-01T00:00:01Z', 'a'),
+    R('2026-01-01T00:00:02Z', 'b'),
+    R('2026-01-01T00:00:03Z', 'c'),
+    R('2026-01-01T00:00:04Z', 'd'),
+  ]);
+  const snap = s.currentSeq(); // 4
+  // 首页取 a,b（pageSize=2），游标停在 b 之后
+  const first = s.readPage('st', snap, { fromTs: '0', toTs: 'z' }, null, 2);
+  assert.deepEqual(first.map((r) => r.sampleId), ['a', 'b']);
+
+  // 分页中途勘误：a 移到最末时刻、c 移到最早时刻
+  s.reviseSample('st', 'a', 1, '2026-01-01T00:00:09.000000000Z', 10);
+  s.reviseSample('st', 'c', 1, '2025-12-31T23:59:59.000000000Z', 30);
+
+  // 用旧快照游标继续：after=(旧 b 位置)，必须仍按旧版页序返回 c,d 且不漏不重
+  const rest = s.readPage(
+    'st', snap, { fromTs: '0', toTs: 'z' },
+    { ts: first[1].ts, sampleId: first[1].sampleId }, 100
+  );
+  assert.deepEqual(rest.map((r) => r.sampleId), ['c', 'd']);
+  assert.equal(rest[0].value, 1, 'c 仍为旧读数');
+  s.close();
+});
+
 test('游标: 签发/解析往返', () => {
   const secret = 'test-secret';
   const payload = {
@@ -216,8 +330,36 @@ test('校验: 小数秒补齐 9 位，字典序与时间序一致', () => {
   assert.ok(ts.b < ts.a && ts.a < ts.c, '0.09 < 0.1 < 0.19');
 });
 
-test('校验: 查询参数 pageSize / 时间范围', () => {
-  const q = validateQuery(new URLSearchParams('pageSize=50&from=2026-01-01T00:00:00Z'));
+test('校验: 勘误请求体 expectedRevision / ts / value', () => {
+  const ok = validateRevision({
+    expectedRevision: 2, ts: '2026-01-01T08:00:00+08:00', value: -3,
+  });
+  assert.deepEqual(ok, {
+    expectedRevision: 2,
+    ts: '2026-01-01T00:00:00.000000000Z',
+    value: -3,
+  });
+  assert.throws(() => validateRevision(null), ValidationError);
+  assert.throws(() => validateRevision({ ts: '2026-01-01T00:00:00Z', value: 1 }),
+    ValidationError, '缺 expectedRevision');
+  assert.throws(() => validateRevision({ expectedRevision: 0, ts: 'x', value: 1 }),
+    ValidationError);
+  assert.throws(() => validateRevision({ expectedRevision: -1, ts: 'x', value: 1 }),
+    ValidationError);
+  assert.throws(() => validateRevision({ expectedRevision: 1.5, ts: 'x', value: 1 }),
+    ValidationError);
+  assert.throws(
+    () => validateRevision({ expectedRevision: '1', ts: '2026-01-01T00:00:00Z', value: 1 }),
+    ValidationError, 'expectedRevision 不得为字符串');
+  assert.throws(
+    () => validateRevision({ expectedRevision: 1, ts: '2026-01-01T00:00:00Z', value: 1.5 }),
+    ValidationError);
+  assert.throws(
+    () => validateRevision({ expectedRevision: 1, ts: 'not-a-time', value: 1 }),
+    ValidationError);
+});
+
+test('校验: 查询参数 pageSize / 时间范围', () => {  const q = validateQuery(new URLSearchParams('pageSize=50&from=2026-01-01T00:00:00Z'));
   assert.equal(q.pageSize, 50);
   assert.equal(q.fromTs, '2026-01-01T00:00:00.000000000Z');
   assert.throws(() => validateQuery(new URLSearchParams('pageSize=0')), ValidationError);
